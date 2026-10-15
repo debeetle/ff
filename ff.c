@@ -27,6 +27,7 @@ enum {
 
 typedef struct {
 	char *raw;
+	char *folded;
 	size_t length;
 } candidate_t;
 
@@ -131,16 +132,33 @@ static bool key_position(char key, int *x, int *y) {
 	return false;
 }
 
-static int substitution_cost(char a, char b) {
-	if (a == b) {
-		return 0;
+static int key_cost[256][256];
+static bool key_cost_ready;
+
+static void init_key_cost_table(void) {
+	if (key_cost_ready) {
+		return;
 	}
-	int ax, ay, bx, by;
-	if (key_position(a, &ax, &ay) && key_position(b, &bx, &by) &&
-	    integer_abs(ax - bx) <= 2 && integer_abs(ay - by) <= 2) {
-		return COST_NEIGHBOR_SUBSTITUTION;
+	for (int a = 0; a < 256; a++) {
+		for (int b = 0; b < 256; b++) {
+			int cost;
+			if (a == b) {
+				cost = 0;
+			} else {
+				int ax, ay, bx, by;
+				if (key_position((char)a, &ax, &ay) &&
+				    key_position((char)b, &bx, &by) &&
+				    integer_abs(ax - bx) <= 2 &&
+				    integer_abs(ay - by) <= 2) {
+					cost = COST_NEIGHBOR_SUBSTITUTION;
+				} else {
+					cost = COST_SUBSTITUTION;
+				}
+			}
+			key_cost[a][b] = cost;
+		}
 	}
-	return COST_SUBSTITUTION;
+	key_cost_ready = true;
 }
 
 static bool add_candidate(candidate_list_t *list, const char *text) {
@@ -160,7 +178,15 @@ static bool add_candidate(candidate_list_t *list, const char *text) {
 	if (item.raw == NULL) {
 		return false;
 	}
+	item.folded = strdup(text);
+	if (item.folded == NULL) {
+		free(item.raw);
+		return false;
+	}
 	item.length = strlen(text);
+	for (size_t i = 0; i < item.length; i++) {
+		item.folded[i] = ascii_lower((unsigned char)item.folded[i]);
+	}
 	list->items[list->length++] = item;
 	return true;
 }
@@ -168,6 +194,7 @@ static bool add_candidate(candidate_list_t *list, const char *text) {
 static void destroy_candidates(candidate_list_t *list) {
 	for (size_t i = 0; i < list->length; i++) {
 		free(list->items[i].raw);
+		free(list->items[i].folded);
 	}
 	free(list->items);
 	memset(list, 0, sizeof(*list));
@@ -236,8 +263,8 @@ static alignment_t align(matcher_t *matcher, const char *query, size_t query_len
 				}
 
 				if (column > 0) {
-					int cost = substitution_cost(query[row - 1],
-					                             ascii_lower((unsigned char)text[column - 1]));
+					int cost = key_cost[(unsigned char)query[row - 1]]
+					                   [(unsigned char)text[column - 1]];
 					int edit_delta = cost == 0 ? 0 : 1;
 					if (edits >= edit_delta) {
 						cell_t source = previous[cell_index(column - 1, edits - edit_delta)];
@@ -255,8 +282,8 @@ static alignment_t align(matcher_t *matcher, const char *query, size_t query_len
 				}
 
 				if (row > 1 && column > 1 && edits > 0 &&
-				    query[row - 2] == ascii_lower((unsigned char)text[column - 1]) &&
-				    query[row - 1] == ascii_lower((unsigned char)text[column - 2])) {
+				    query[row - 2] == text[column - 1] &&
+				    query[row - 1] == text[column - 2]) {
 					cell_t source = previous_previous[cell_index(column - 2, edits - 1)];
 					if (source.valid) {
 						update_cell(destination, source.cost + COST_TRANSPOSITION, source.start);
@@ -320,6 +347,8 @@ static int compare_matches(const void *left, const void *right) {
 
 static size_t find_matches(matcher_t *matcher, candidate_list_t *candidates,
 	                       const char *query, size_t query_length, match_t *matches) {
+	init_key_cost_table();
+
 	if (query_length == 0) {
 		for (size_t i = 0; i < candidates->length; i++) {
 			matches[i] = (match_t){.candidate = &candidates->items[i]};
@@ -327,11 +356,77 @@ static size_t find_matches(matcher_t *matcher, candidate_list_t *candidates,
 		return candidates->length;
 	}
 
+	int limit = (query_length == 0) ? 0 : max_edits(query_length);
+	size_t minimum_length = 0;
+	if (query_length > (size_t)limit) {
+		minimum_length = query_length - (size_t)limit;
+	}
+	int required_exact = (int)query_length - limit;
+
+	int query_counts[256];
+	memset(query_counts, 0, sizeof(query_counts));
+	if (query_length > 0) {
+		for (size_t i = 0; i < query_length; i++) {
+			query_counts[(unsigned char)query[i]]++;
+		}
+	}
+
 	size_t count = 0;
 	for (size_t i = 0; i < candidates->length; i++) {
 		candidate_t *candidate = &candidates->items[i];
-		alignment_t result = align(matcher, query, query_length,
-		                           candidate->raw, candidate->length);
+		if (query_length > 0) {
+			if (candidate->length < minimum_length) {
+				continue;
+			}
+			if (required_exact > 0) {
+				int remaining[256];
+				memcpy(remaining, query_counts, sizeof(remaining));
+				int common = 0;
+				for (size_t ci = 0;
+				     ci < candidate->length && common < required_exact;
+				     ci++) {
+					unsigned char character =
+					    (unsigned char)candidate->folded[ci];
+					if (remaining[character] > 0) {
+						remaining[character]--;
+						common++;
+					}
+				}
+				if (common < required_exact) {
+					continue;
+				}
+			}
+		}
+		alignment_t result;
+		if (query_length == 1) {
+			const char *found = strchr(candidate->folded, query[0]);
+			if (found == NULL) {
+				continue;
+			}
+			result.cost = 0;
+			result.edits = 0;
+			result.start = (int)(found - candidate->folded);
+			result.span = 1;
+		} else if (query_length == 2) {
+			int position = -1;
+			for (size_t ci = 0; ci + 1 < candidate->length; ci++) {
+				if (candidate->folded[ci] == query[0] &&
+				    candidate->folded[ci + 1] == query[1]) {
+					position = (int)ci;
+					break;
+				}
+			}
+			if (position < 0) {
+				continue;
+			}
+			result.cost = 0;
+			result.edits = 0;
+			result.start = position;
+			result.span = 2;
+		} else {
+			result = align(matcher, query, query_length,
+			               candidate->folded, candidate->length);
+		}
 		if (result.cost == INT_MAX) {
 			continue;
 		}
@@ -418,7 +513,7 @@ static bool render_menu(buffer_t *buffer, int rows, int columns, int *drawn_rows
 	}
 	int menu_rows = 1;
 	if (rows > 1) {
-		size_t result_rows = match_count > 0 ? match_count : 1;
+		size_t result_rows = match_count;
 		if (result_rows > (size_t)(rows - 1)) {
 			result_rows = (size_t)(rows - 1);
 		}
@@ -464,10 +559,6 @@ static bool render_menu(buffer_t *buffer, int rows, int columns, int *drawn_rows
 					return false;
 				}
 				if (index == selected && !append_string(buffer, "\033[0m")) {
-					return false;
-				}
-			} else if (row == 1 && match_count == 0) {
-				if (!append_string(buffer, "\033[2m(no matches)\033[0m")) {
 					return false;
 				}
 			}
