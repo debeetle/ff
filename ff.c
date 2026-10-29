@@ -2,11 +2,14 @@
 #define _DARWIN_C_SOURCE
 #define _XOPEN_SOURCE 700
 
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -82,6 +85,9 @@ typedef enum {
 	KEY_BACKSPACE,
 	KEY_PREVIOUS,
 	KEY_NEXT,
+	KEY_BEGINNING,
+	KEY_END,
+	KEY_DELETE_WORD,
 } key_kind_t;
 
 typedef struct {
@@ -106,6 +112,43 @@ static char ascii_lower(unsigned char character) {
 		return (char)(character + ('a' - 'A'));
 	}
 	return (char)character;
+}
+
+static bool character_is_escaped(const char *text, size_t index) {
+	size_t backslashes = 0;
+	while (index > 0 && text[index - 1] == '\\') {
+		backslashes++;
+		index--;
+	}
+	return (backslashes & 1u) != 0;
+}
+
+static bool is_path_separator(const char *text, size_t index) {
+	unsigned char character = (unsigned char)text[index];
+	bool separator;
+	switch (character) {
+	case '/':
+	case '=':
+	case '{':
+	case ',':
+	case '}':
+	case '\'':
+	case '"':
+	case ':':
+	case '@':
+	case '#':
+	case '|':
+	case ';':
+	case '<':
+	case '>':
+	case '&':
+		separator = true;
+		break;
+	default:
+		separator = isspace(character) != 0;
+		break;
+	}
+	return separator && !character_is_escaped(text, index);
 }
 
 static int max_edits(size_t query_length) {
@@ -345,12 +388,27 @@ static int compare_matches(const void *left, const void *right) {
 	return a->candidate < b->candidate ? -1 : 1;
 }
 
+static bool scan_should_stop(int interrupt_fd, const input_buffer_t *input) {
+	if (interrupt_fd < 0 || input == NULL) {
+		return false;
+	}
+	if (input->length > 0) {
+		return true;
+	}
+	struct pollfd descriptor = {.fd = interrupt_fd, .events = POLLIN};
+	return poll(&descriptor, 1, 0) > 0 && (descriptor.revents & POLLIN) != 0;
+}
+
 static size_t find_matches(matcher_t *matcher, candidate_list_t *candidates,
-	                       const char *query, size_t query_length, match_t *matches) {
+	                       const char *query, size_t query_length, match_t *matches,
+	                       int interrupt_fd, const input_buffer_t *input) {
 	init_key_cost_table();
 
 	if (query_length == 0) {
 		for (size_t i = 0; i < candidates->length; i++) {
+			if ((i & 4095u) == 0 && scan_should_stop(interrupt_fd, input)) {
+				return SIZE_MAX;
+			}
 			matches[i] = (match_t){.candidate = &candidates->items[i]};
 		}
 		return candidates->length;
@@ -373,6 +431,9 @@ static size_t find_matches(matcher_t *matcher, candidate_list_t *candidates,
 
 	size_t count = 0;
 	for (size_t i = 0; i < candidates->length; i++) {
+		if ((i & 255u) == 0 && scan_should_stop(interrupt_fd, input)) {
+			return SIZE_MAX;
+		}
 		candidate_t *candidate = &candidates->items[i];
 		if (query_length > 0) {
 			if (candidate->length < minimum_length) {
@@ -438,7 +499,13 @@ static size_t find_matches(matcher_t *matcher, candidate_list_t *candidates,
 			.span = result.span,
 		};
 	}
+	if (scan_should_stop(interrupt_fd, input)) {
+		return SIZE_MAX;
+	}
 	qsort(matches, count, sizeof(*matches), compare_matches);
+	if (scan_should_stop(interrupt_fd, input)) {
+		return SIZE_MAX;
+	}
 	return count;
 }
 
@@ -502,7 +569,7 @@ static bool append_display(buffer_t *buffer, const char *text, int limit, int *u
 }
 
 static bool render_menu(buffer_t *buffer, int rows, int columns, int *drawn_rows,
-	                    const char *query,
+	                    const char *query, size_t query_cursor,
 	                    match_t *matches, size_t match_count,
 	                    size_t selected, size_t *top) {
 	if (rows < 1) {
@@ -573,11 +640,27 @@ static bool render_menu(buffer_t *buffer, int rows, int columns, int *drawn_rows
 	if (!append_string(buffer, "\r")) {
 		return false;
 	}
-	if (!append_cursor_move(buffer, query_width, 'C')) {
+	int cursor_column = query_cursor < (size_t)query_width
+	                    ? (int)query_cursor : query_width;
+	if (!append_cursor_move(buffer, cursor_column, 'C')) {
 		return false;
 	}
 	*drawn_rows = menu_rows;
 	return true;
+}
+
+static bool render_query_line(buffer_t *buffer, int columns, const char *query,
+	                          size_t query_cursor) {
+	int width = 0;
+	int cursor_column = 0;
+	buffer->length = 0;
+	if (!append_string(buffer, "\r\033[2K\033[1m") ||
+	    !append_display(buffer, query, columns, &width) ||
+	    !append_string(buffer, "\033[0m")) {
+		return false;
+	}
+	cursor_column = query_cursor < (size_t)width ? (int)query_cursor : width;
+	return append_cursor_move(buffer, width - cursor_column, 'D');
 }
 
 static bool write_all(int fd, const char *data, size_t length) {
@@ -689,8 +772,14 @@ static bool next_key(input_buffer_t *input, bool timed_out, key_event_t *event) 
 		unsigned char character = data[0];
 		consume_input(input, 1);
 		switch (character) {
+		case 1:
+			event->kind = KEY_BEGINNING;
+			return true;
 		case 3:
 			event->kind = KEY_CANCEL;
+			return true;
+		case 5:
+			event->kind = KEY_END;
 			return true;
 		case '\r':
 			event->kind = KEY_ENTER;
@@ -700,6 +789,9 @@ static bool next_key(input_buffer_t *input, bool timed_out, key_event_t *event) 
 			return true;
 		case 11:
 			event->kind = KEY_PREVIOUS;
+			return true;
+		case 23:
+			event->kind = KEY_DELETE_WORD;
 			return true;
 		case 127:
 			event->kind = KEY_BACKSPACE;
@@ -768,28 +860,56 @@ static bool load_candidates(candidate_list_t *list, int argc, char **argv) {
 	return !ferror(stdin);
 }
 
+static bool parse_height_option(const char *argument, int *height_percent) {
+	const char *value;
+	char *end;
+	long parsed;
+
+	if (strncmp(argument, "--height=", 9) != 0) {
+		return false;
+	}
+	value = argument + 9;
+	errno = 0;
+	parsed = strtol(value, &end, 10);
+	if (end == value || *end != '%' || end[1] != '\0' || errno != 0 ||
+	    parsed < 1 || parsed > 100) {
+		fprintf(stderr, "fuzzymenu: invalid height: %s\n", value);
+		exit(2);
+	}
+	*height_percent = (int)parsed;
+	return true;
+}
+
 static int run_menu(candidate_list_t *candidates, char *query,
-	                size_t query_length, matcher_t *matcher) {
-	match_t *matches = calloc(candidates->length == 0 ? 1 : candidates->length,
-	                          sizeof(*matches));
-	if (matches == NULL) {
+	                size_t query_length, matcher_t *matcher,
+	                int height_percent) {
+	size_t capacity = candidates->length == 0 ? 1 : candidates->length;
+	match_t *front = calloc(capacity, sizeof(*front));
+	match_t *work = calloc(capacity, sizeof(*work));
+	if (front == NULL || work == NULL) {
 		fprintf(stderr, "fuzzymenu: out of memory\n");
+		free(front);
+		free(work);
 		return 2;
 	}
-	size_t match_count = find_matches(matcher, candidates, query, query_length, matches);
+	size_t match_count = find_matches(matcher, candidates, query, query_length,
+	                                  front, -1, NULL);
+	size_t query_cursor = query_length;
 	size_t selected = 0;
 	size_t top = 0;
 
 	terminal_t terminal;
 	if (!start_terminal(&terminal)) {
 		fprintf(stderr, "fuzzymenu: cannot initialize /dev/tty: %s\n", strerror(errno));
-		free(matches);
+		free(front);
+		free(work);
 		return 2;
 	}
 	if (!install_signals()) {
 		close_terminal(&terminal);
 		fprintf(stderr, "fuzzymenu: cannot install signal handlers: %s\n", strerror(errno));
-		free(matches);
+		free(front);
+		free(work);
 		return 2;
 	}
 
@@ -797,6 +917,8 @@ static int run_menu(candidate_list_t *candidates, char *query,
 	input_buffer_t input = {0};
 	const char *selection = NULL;
 	bool redraw = true;
+	bool prompt_redraw = false;
+	bool match_pending = false;
 	int result = 1;
 	for (;;) {
 		if (stop_pending) {
@@ -814,14 +936,52 @@ static int run_menu(candidate_list_t *candidates, char *query,
 				result = 2;
 				break;
 			}
-			if (!render_menu(&frame, rows, columns, &terminal.drawn_rows, query,
-			                 matches, match_count, selected, &top) ||
+			if (height_percent < 100) {
+				int usable_rows = rows * height_percent / 100;
+				if (usable_rows < 1) {
+					usable_rows = 1;
+				}
+				rows = usable_rows;
+			}
+			if (!render_menu(&frame, rows, columns, &terminal.drawn_rows,
+			                 query, query_cursor, front, match_count, selected, &top) ||
 			    !write_all(terminal.fd, frame.data, frame.length)) {
 				fprintf(stderr, "fuzzymenu: cannot draw terminal: %s\n", strerror(errno));
 				result = 2;
 				break;
 			}
 			redraw = false;
+			prompt_redraw = false;
+		} else if (prompt_redraw) {
+			int rows, columns;
+			if (!terminal_size(terminal.fd, &rows, &columns)) {
+				fprintf(stderr, "fuzzymenu: cannot draw terminal: %s\n", strerror(errno));
+				result = 2;
+				break;
+			}
+			if (!render_query_line(&frame, columns, query, query_cursor) ||
+			    !write_all(terminal.fd, frame.data, frame.length)) {
+				fprintf(stderr, "fuzzymenu: cannot draw terminal: %s\n", strerror(errno));
+				result = 2;
+				break;
+			}
+			prompt_redraw = false;
+		}
+
+		if (match_pending) {
+			size_t count = find_matches(matcher, candidates, query, query_length,
+			                            work, terminal.fd, &input);
+			if (count != SIZE_MAX) {
+				match_t *temporary = front;
+				front = work;
+				work = temporary;
+				match_count = count;
+				selected = 0;
+				top = 0;
+				match_pending = false;
+				redraw = true;
+				continue;
+			}
 		}
 
 		unsigned char bytes[64];
@@ -848,45 +1008,78 @@ static int run_menu(candidate_list_t *candidates, char *query,
 		bool timed_out = length == 0;
 		key_event_t event;
 		while (next_key(&input, timed_out, &event)) {
-			bool query_changed = false;
 			switch (event.kind) {
 			case KEY_CANCEL:
 				result = 1;
 				goto done;
 			case KEY_ENTER:
+				// Enter accepts exactly what is on screen; a pending scan must not
+				// silently replace the visible selection.
 				if (match_count > 0) {
-					selection = matches[selected].candidate->raw;
+					selection = front[selected].candidate->raw;
 					result = 0;
 					goto done;
 				}
 				break;
+			case KEY_BEGINNING:
+				if (query_cursor != 0) {
+					query_cursor = 0;
+					prompt_redraw = true;
+				}
+				break;
+			case KEY_END:
+				if (query_cursor != query_length) {
+					query_cursor = query_length;
+					prompt_redraw = true;
+				}
+				break;
+			case KEY_DELETE_WORD: {
+				size_t start = query_cursor;
+				while (start > 0 && is_path_separator(query, start - 1)) {
+					start--;
+				}
+				while (start > 0 && !is_path_separator(query, start - 1)) {
+					start--;
+				}
+				if (start < query_cursor) {
+					memmove(query + start, query + query_cursor,
+					        query_length - query_cursor + 1);
+					query_length -= query_cursor - start;
+					query_cursor = start;
+					prompt_redraw = true;
+					match_pending = true;
+				}
+				break;
+			}
 			case KEY_BACKSPACE:
-				if (query_length > 0) {
-					query[--query_length] = '\0';
-					query_changed = true;
+				if (query_cursor > 0) {
+					memmove(query + query_cursor - 1, query + query_cursor,
+					        query_length - query_cursor + 1);
+					query_cursor--;
+					query_length--;
+					prompt_redraw = true;
+					match_pending = true;
 				}
 				break;
 			case KEY_CHARACTER:
 				if (query_length < MAX_QUERY) {
-					query[query_length++] = ascii_lower((unsigned char)event.character);
-					query[query_length] = '\0';
-					query_changed = true;
+					memmove(query + query_cursor + 1, query + query_cursor,
+					        query_length - query_cursor + 1);
+					query[query_cursor++] = ascii_lower((unsigned char)event.character);
+					query_length++;
+					prompt_redraw = true;
+					match_pending = true;
 				}
 				break;
 			case KEY_PREVIOUS:
 				if (selected > 0) selected--;
+				redraw = true;
 				break;
 			case KEY_NEXT:
 				if (selected + 1 < match_count) selected++;
+				redraw = true;
 				break;
 			}
-
-			if (query_changed) {
-				match_count = find_matches(matcher, candidates, query, query_length, matches);
-				selected = 0;
-				top = 0;
-			}
-			redraw = true;
 		}
 	}
 
@@ -896,13 +1089,21 @@ done:
 		printf("%s\n", selection);
 	}
 	free(frame.data);
-	free(matches);
+	free(front);
+	free(work);
 	return result;
 }
 
 int main(int argc, char **argv) {
+	int height_percent = 100;
+	int option_count = 0;
+	while (option_count + 1 < argc &&
+	       parse_height_option(argv[option_count + 1], &height_percent)) {
+		option_count++;
+	}
+
 	candidate_list_t candidates = {0};
-	if (!load_candidates(&candidates, argc, argv)) {
+	if (!load_candidates(&candidates, argc - option_count, argv + option_count)) {
 		fprintf(stderr, "fuzzymenu: cannot read candidates: %s\n", strerror(errno));
 		destroy_candidates(&candidates);
 		return 2;
@@ -922,7 +1123,7 @@ int main(int argc, char **argv) {
 	}
 
 	char query[MAX_QUERY + 1] = {0};
-	int result = run_menu(&candidates, query, 0, &matcher);
+	int result = run_menu(&candidates, query, 0, &matcher, height_percent);
 	destroy_matcher(&matcher);
 	destroy_candidates(&candidates);
 	return result;
